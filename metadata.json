@@ -1,0 +1,6 @@
+{
+  "name": "Henry's Executive AI Assistant",
+  "description": "Professional English voice and interactive AI assistant representing Henry Anton — covering background, business education, work experience, logistics, and skills.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
