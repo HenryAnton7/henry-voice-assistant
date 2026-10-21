@@ -7,10 +7,15 @@ interface LiveVoiceModalProps {
   isOpen: boolean;
   onClose: () => void;
   onSendTranscriptToChat?: (text: string, role: 'user' | 'assistant') => void;
+  // When false the modal opens in a "tap to start" state. Phones only allow the
+  // microphone and audio playback after a tap, so direct links (?voice) need this.
+  autoStart?: boolean;
 }
 
-export default function LiveVoiceModal({ isOpen, onClose }: LiveVoiceModalProps) {
-  const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'connected' | 'error' | 'closed'>('connecting');
+export default function LiveVoiceModal({ isOpen, onClose, autoStart = true }: LiveVoiceModalProps) {
+  const [connectionStatus, setConnectionStatus] = useState<'idle' | 'connecting' | 'connected' | 'error' | 'closed'>(
+    autoStart ? 'connecting' : 'idle'
+  );
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isMuted, setIsMuted] = useState(false);
   const [typedPrompt, setTypedPrompt] = useState('');
@@ -230,14 +235,14 @@ export default function LiveVoiceModal({ isOpen, onClose }: LiveVoiceModalProps)
 
   useEffect(() => {
     if (isOpen) {
-      startLiveSession();
+      if (autoStart) startLiveSession();
     } else {
       cleanup();
     }
     return () => {
       cleanup();
     };
-  }, [isOpen, startLiveSession, cleanup]);
+  }, [isOpen, autoStart, startLiveSession, cleanup]);
 
   const handleInterrupt = () => {
     playerRef.current?.stop();
@@ -332,6 +337,7 @@ export default function LiveVoiceModal({ isOpen, onClose }: LiveVoiceModalProps)
           {/* Status Label */}
           <div className="mt-6 text-center space-y-1">
             <p className="text-xs uppercase tracking-widest text-stone-500 font-sans">
+              {connectionStatus === 'idle' && 'Tap “Start conversation” to talk with the assistant'}
               {connectionStatus === 'connecting' && 'Connecting to Live Voice...'}
               {connectionStatus === 'connected' && isAssistantSpeaking && "Henry's Assistant is speaking..."}
               {connectionStatus === 'connected' && isUserSpeaking && 'Listening to you...'}
@@ -452,7 +458,17 @@ export default function LiveVoiceModal({ isOpen, onClose }: LiveVoiceModalProps)
               </button>
             )}
 
-            {connectionStatus !== 'connected' && (
+            {connectionStatus === 'idle' && (
+              <button
+                onClick={startLiveSession}
+                className="flex items-center space-x-1.5 px-4 py-2 rounded-lg text-xs font-medium bg-stone-900 hover:bg-stone-800 text-white transition-colors"
+              >
+                <Mic className="w-3.5 h-3.5" />
+                <span>Start conversation</span>
+              </button>
+            )}
+
+            {connectionStatus !== 'connected' && connectionStatus !== 'idle' && (
               <button
                 onClick={startLiveSession}
                 className="flex items-center space-x-1 px-3.5 py-2 rounded-lg text-xs font-medium bg-stone-900 text-white transition-colors"

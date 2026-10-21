@@ -14,7 +14,11 @@ import type { ResumeData } from './types';
 
 export default function App() {
   const [resumeData, setResumeData] = useState<ResumeData | null>(null);
-  const [isLiveVoiceOpen, setIsLiveVoiceOpen] = useState(false);
+  // A link like /?voice (e.g. from a QR code) opens the voice assistant straight away.
+  const [openedFromVoiceLink, setOpenedFromVoiceLink] = useState(() =>
+    new URLSearchParams(window.location.search).has('voice')
+  );
+  const [isLiveVoiceOpen, setIsLiveVoiceOpen] = useState(openedFromVoiceLink);
   const [isContactOpen, setIsContactOpen] = useState(false);
   const [selectedPrompt, setSelectedPrompt] = useState<string | null>(null);
   const [isPlayingGreeting, setIsPlayingGreeting] = useState(false);
@@ -189,7 +193,11 @@ export default function App() {
       {/* Live Voice Conversation Modal (Gemini 3.8 Live API) */}
       <LiveVoiceModal
         isOpen={isLiveVoiceOpen}
-        onClose={() => setIsLiveVoiceOpen(false)}
+        onClose={() => {
+          setIsLiveVoiceOpen(false);
+          setOpenedFromVoiceLink(false);
+        }}
+        autoStart={!openedFromVoiceLink}
       />
 
       {/* Contact & Recruitment Modal */}
