@@ -1,17 +1,24 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { Mic, MicOff, Volume2, X, PhoneOff, Radio, RefreshCw, AlertCircle } from 'lucide-react';
+import { Mic, MicOff, Volume2, X, PhoneOff, Radio, RefreshCw, AlertCircle, Send } from 'lucide-react';
+import type { LiveServerMessage, Session } from '@google/genai';
 import { LiveAudioPlayer, LiveAudioRecorder } from '../utils/audio';
 
 interface LiveVoiceModalProps {
   isOpen: boolean;
   onClose: () => void;
   onSendTranscriptToChat?: (text: string, role: 'user' | 'assistant') => void;
+  // When false the modal opens in a "tap to start" state. Phones only allow the
+  // microphone and audio playback after a tap, so direct links (?voice) need this.
+  autoStart?: boolean;
 }
 
-export default function LiveVoiceModal({ isOpen, onClose }: LiveVoiceModalProps) {
-  const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'connected' | 'error' | 'closed'>('connecting');
+export default function LiveVoiceModal({ isOpen, onClose, autoStart = true }: LiveVoiceModalProps) {
+  const [connectionStatus, setConnectionStatus] = useState<'idle' | 'connecting' | 'connected' | 'error' | 'closed'>(
+    autoStart ? 'connecting' : 'idle'
+  );
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isMuted, setIsMuted] = useState(false);
+  const [typedPrompt, setTypedPrompt] = useState('');
   const [isAssistantSpeaking, setIsAssistantSpeaking] = useState(false);
   const [isUserSpeaking, setIsUserSpeaking] = useState(false);
   const [transcripts, setTranscripts] = useState<Array<{ id: string; role: 'user' | 'assistant'; text: string }>>([
@@ -22,86 +29,163 @@ export default function LiveVoiceModal({ isOpen, onClose }: LiveVoiceModalProps)
     },
   ]);
 
-  const wsRef = useRef<WebSocket | null>(null);
+  const sessionRef = useRef<Session | null>(null);
   const recorderRef = useRef<LiveAudioRecorder | null>(null);
   const playerRef = useRef<LiveAudioPlayer | null>(null);
   const animFrameRef = useRef<number | null>(null);
+  const transcriptEndRef = useRef<HTMLDivElement | null>(null);
+  const isMutedRef = useRef(isMuted);
+  // Each live session gets an id so callbacks from an old, closed session are ignored.
+  const sessionIdRef = useRef(0);
+  // Whether the next transcription chunk for a role should start a new bubble.
+  const turnOpenRef = useRef<{ user: boolean; assistant: boolean }>({ user: false, assistant: false });
   const [audioLevel, setAudioLevel] = useState(0);
 
+  useEffect(() => {
+    isMutedRef.current = isMuted;
+  }, [isMuted]);
+
+  useEffect(() => {
+    transcriptEndRef.current?.scrollIntoView({ block: 'nearest' });
+  }, [transcripts]);
+
+  const appendTranscript = useCallback((role: 'user' | 'assistant', text: string) => {
+    const continueTurn = turnOpenRef.current[role];
+    turnOpenRef.current[role] = true;
+    setTranscripts((prev) => {
+      const last = prev[prev.length - 1];
+      if (continueTurn && last && last.role === role) {
+        return [...prev.slice(0, -1), { ...last, text: last.text + text }];
+      }
+      return [...prev, { id: `${role}-${Date.now()}-${prev.length}`, role, text: text.trimStart() }];
+    });
+  }, []);
+
+  const stopSession = useCallback(() => {
+    sessionIdRef.current += 1;
+    if (recorderRef.current) {
+      recorderRef.current.stop();
+      recorderRef.current = null;
+    }
+    if (playerRef.current) {
+      playerRef.current.close();
+      playerRef.current = null;
+    }
+    if (sessionRef.current) {
+      try {
+        sessionRef.current.close();
+      } catch {
+        // ignore
+      }
+      sessionRef.current = null;
+    }
+  }, []);
+
   const startLiveSession = useCallback(async () => {
+    stopSession();
+    const sessionId = sessionIdRef.current;
+    const isCurrent = () => sessionIdRef.current === sessionId;
+
     setConnectionStatus('connecting');
     setErrorMessage(null);
+    turnOpenRef.current = { user: false, assistant: false };
 
     try {
+      // Create the audio output right away, while the click that opened the modal still
+      // counts as a user gesture (otherwise browsers may keep the AudioContext suspended).
       playerRef.current = new LiveAudioPlayer();
       playerRef.current.init();
 
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${protocol}//${window.location.host}/live-ws`;
-      const ws = new WebSocket(wsUrl);
-      wsRef.current = ws;
+      // 1. Ask our server for a short-lived token (the real API key stays on the server).
+      const tokenRes = await fetch('/api/live-token', { method: 'POST' });
+      const tokenData = await tokenRes.json().catch(() => ({}));
+      if (!tokenRes.ok || !tokenData.token) {
+        throw new Error(tokenData.error || `Live token request failed (${tokenRes.status})`);
+      }
+      if (!isCurrent()) return;
 
-      ws.onopen = async () => {
-        setConnectionStatus('connected');
-        try {
-          const recorder = new LiveAudioRecorder();
-          recorderRef.current = recorder;
+      // 2. Connect from the browser straight to the Gemini Live API. The SDK is loaded
+      // on demand so it doesn't weigh down the initial page load.
+      const { GoogleGenAI, Modality } = await import('@google/genai');
+      if (!isCurrent()) return;
+      const ai = new GoogleGenAI({ apiKey: tokenData.token, httpOptions: { apiVersion: 'v1alpha' } });
+      const session = await ai.live.connect({
+        model: tokenData.model,
+        config: { responseModalities: [Modality.AUDIO] },
+        callbacks: {
+          onmessage: (message: LiveServerMessage) => {
+            if (!isCurrent()) return;
+            const content = message.serverContent;
+            if (!content) return;
 
-          await recorder.start((base64Chunk) => {
-            if (ws.readyState === WebSocket.OPEN && !isMuted) {
-              ws.send(JSON.stringify({ audio: base64Chunk }));
-            }
-          });
-        } catch (micErr: any) {
-          console.error('Microphone error:', micErr);
-          setErrorMessage('Microphone access is unavailable. Please grant microphone permission in your browser.');
-        }
-      };
-
-      ws.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data);
-
-          if (data.type === 'ready') {
-            setConnectionStatus('connected');
-          } else if (data.type === 'audio' && data.audio) {
-            setIsAssistantSpeaking(true);
-            playerRef.current?.playChunk(data.audio);
-          } else if (data.type === 'text' && data.text) {
-            setTranscripts((prev) => {
-              const last = prev[prev.length - 1];
-              if (last && last.role === 'assistant') {
-                return [...prev.slice(0, -1), { ...last, text: last.text + ' ' + data.text }];
+            for (const part of content.modelTurn?.parts ?? []) {
+              if (part.inlineData?.data) {
+                setIsAssistantSpeaking(true);
+                playerRef.current?.playChunk(part.inlineData.data);
               }
-              return [...prev, { id: String(Date.now()), role: 'assistant', text: data.text }];
-            });
-          } else if (data.type === 'interrupted') {
-            playerRef.current?.stop();
-            setIsAssistantSpeaking(false);
-          } else if (data.type === 'error') {
-            setErrorMessage(data.message || 'Live session error occurred');
-          } else if (data.type === 'closed') {
+            }
+
+            if (content.inputTranscription?.text) {
+              turnOpenRef.current.assistant = false;
+              appendTranscript('user', content.inputTranscription.text);
+            }
+            if (content.outputTranscription?.text) {
+              turnOpenRef.current.user = false;
+              appendTranscript('assistant', content.outputTranscription.text);
+            }
+
+            if (content.interrupted) {
+              playerRef.current?.stop();
+              setIsAssistantSpeaking(false);
+            }
+            if (content.turnComplete) {
+              turnOpenRef.current = { user: false, assistant: false };
+            }
+          },
+          onerror: (e: ErrorEvent) => {
+            if (!isCurrent()) return;
+            console.error('Live session error:', e);
+            setConnectionStatus('error');
+            setErrorMessage(e?.message || 'Failed to connect to Live Voice service.');
+          },
+          onclose: (e: CloseEvent) => {
+            if (!isCurrent()) return;
             setConnectionStatus('closed');
-          }
-        } catch (err) {
-          console.error('Failed to parse WebSocket message:', err);
-        }
-      };
+            // Gemini puts the reason (e.g. invalid model, expired token) in the close frame.
+            if (e?.reason) setErrorMessage(`Voice session closed: ${e.reason}`);
+          },
+        },
+      });
 
-      ws.onerror = () => {
-        setConnectionStatus('error');
-        setErrorMessage('Failed to connect to Live Voice service. Please check your network connection.');
-      };
+      if (!isCurrent()) {
+        session.close();
+        return;
+      }
+      sessionRef.current = session;
+      setConnectionStatus('connected');
 
-      ws.onclose = () => {
-        setConnectionStatus('closed');
-      };
+      // 3. Start streaming the microphone (16 kHz PCM). Text prompts still work without it.
+      try {
+        const recorder = new LiveAudioRecorder();
+        recorderRef.current = recorder;
+        await recorder.start((base64Chunk) => {
+          if (!isCurrent() || isMutedRef.current) return;
+          sessionRef.current?.sendRealtimeInput({
+            audio: { data: base64Chunk, mimeType: 'audio/pcm;rate=16000' },
+          });
+        });
+      } catch (micErr: any) {
+        console.error('Microphone error:', micErr);
+        recorderRef.current = null;
+        setErrorMessage('Microphone access is unavailable. Please grant microphone permission in your browser. You can still use the quick-ask buttons.');
+      }
     } catch (err: any) {
+      if (!isCurrent()) return;
       console.error('Session start error:', err);
       setConnectionStatus('error');
-      setErrorMessage(err?.message || 'Could not initialize live session');
+      setErrorMessage(err?.message || 'Failed to connect to Live Voice service.');
     }
-  }, [isMuted]);
+  }, [appendTranscript, stopSession]);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -142,48 +226,37 @@ export default function LiveVoiceModal({ isOpen, onClose }: LiveVoiceModalProps)
   }, [isOpen, isMuted]);
 
   const cleanup = useCallback(() => {
-    if (recorderRef.current) {
-      recorderRef.current.stop();
-      recorderRef.current = null;
-    }
-    if (playerRef.current) {
-      playerRef.current.close();
-      playerRef.current = null;
-    }
-    if (wsRef.current) {
-      wsRef.current.close();
-      wsRef.current = null;
-    }
+    stopSession();
     if (animFrameRef.current) {
       cancelAnimationFrame(animFrameRef.current);
       animFrameRef.current = null;
     }
-  }, []);
+  }, [stopSession]);
 
   useEffect(() => {
     if (isOpen) {
-      startLiveSession();
+      if (autoStart) startLiveSession();
     } else {
       cleanup();
     }
     return () => {
       cleanup();
     };
-  }, [isOpen, startLiveSession, cleanup]);
+  }, [isOpen, autoStart, startLiveSession, cleanup]);
 
   const handleInterrupt = () => {
     playerRef.current?.stop();
     setIsAssistantSpeaking(false);
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ text: '[User interrupted]' }));
-    }
   };
 
+  // Text → voice: typed/quick prompts are sent into the live session and answered aloud.
   const handleSendPromptText = (prompt: string) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      setTranscripts((prev) => [...prev, { id: String(Date.now()), role: 'user', text: prompt }]);
-      wsRef.current.send(JSON.stringify({ text: prompt }));
-    }
+    const session = sessionRef.current;
+    if (!session || connectionStatus !== 'connected') return;
+    playerRef.current?.stop();
+    turnOpenRef.current = { user: false, assistant: false };
+    setTranscripts((prev) => [...prev, { id: `user-${Date.now()}`, role: 'user', text: prompt }]);
+    session.sendRealtimeInput({ text: prompt });
   };
 
   if (!isOpen) return null;
@@ -264,6 +337,7 @@ export default function LiveVoiceModal({ isOpen, onClose }: LiveVoiceModalProps)
           {/* Status Label */}
           <div className="mt-6 text-center space-y-1">
             <p className="text-xs uppercase tracking-widest text-stone-500 font-sans">
+              {connectionStatus === 'idle' && 'Tap “Start conversation” to talk with the assistant'}
               {connectionStatus === 'connecting' && 'Connecting to Live Voice...'}
               {connectionStatus === 'connected' && isAssistantSpeaking && "Henry's Assistant is speaking..."}
               {connectionStatus === 'connected' && isUserSpeaking && 'Listening to you...'}
@@ -308,6 +382,7 @@ export default function LiveVoiceModal({ isOpen, onClose }: LiveVoiceModalProps)
               </span>
             </div>
           ))}
+          <div ref={transcriptEndRef} />
         </div>
 
         {/* Quick Question Prompts */}
@@ -329,6 +404,35 @@ export default function LiveVoiceModal({ isOpen, onClose }: LiveVoiceModalProps)
             </button>
           ))}
         </div>
+
+        {/* Typed question → spoken answer */}
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            const text = typedPrompt.trim();
+            if (!text) return;
+            handleSendPromptText(text);
+            setTypedPrompt('');
+          }}
+          className="px-6 py-2.5 bg-[#FAF8F5] border-t border-[#EBE6DF] flex items-center space-x-2"
+        >
+          <input
+            type="text"
+            value={typedPrompt}
+            onChange={(e) => setTypedPrompt(e.target.value)}
+            placeholder="Type a question to hear the answer..."
+            disabled={connectionStatus !== 'connected'}
+            className="flex-1 min-w-0 text-xs px-3 py-2 rounded-lg bg-white border border-[#DDD5C7] text-stone-800 placeholder:text-stone-400 focus:outline-none focus:border-stone-500 disabled:opacity-50"
+          />
+          <button
+            type="submit"
+            disabled={connectionStatus !== 'connected' || !typedPrompt.trim()}
+            className="flex items-center space-x-1 px-3 py-2 rounded-lg text-xs font-medium bg-stone-900 hover:bg-stone-800 text-white transition-colors disabled:opacity-40"
+          >
+            <Send className="w-3.5 h-3.5" />
+            <span>Ask</span>
+          </button>
+        </form>
 
         {/* Controls */}
         <div className="flex items-center justify-between px-6 py-4 bg-white border-t border-[#EBE6DF]">
@@ -354,7 +458,17 @@ export default function LiveVoiceModal({ isOpen, onClose }: LiveVoiceModalProps)
               </button>
             )}
 
-            {connectionStatus !== 'connected' && (
+            {connectionStatus === 'idle' && (
+              <button
+                onClick={startLiveSession}
+                className="flex items-center space-x-1.5 px-4 py-2 rounded-lg text-xs font-medium bg-stone-900 hover:bg-stone-800 text-white transition-colors"
+              >
+                <Mic className="w-3.5 h-3.5" />
+                <span>Start conversation</span>
+              </button>
+            )}
+
+            {connectionStatus !== 'connected' && connectionStatus !== 'idle' && (
               <button
                 onClick={startLiveSession}
                 className="flex items-center space-x-1 px-3.5 py-2 rounded-lg text-xs font-medium bg-stone-900 text-white transition-colors"
